@@ -6,9 +6,9 @@
 """
 Biblioteca Gráfica / Graphics Library.
 
-Desenvolvido por: <SEU NOME AQUI>
+Desenvolvido por: <John Massaru Yang>
 Disciplina: Computação Gráfica
-Data: <DATA DE INÍCIO DA IMPLEMENTAÇÃO>
+Data: <03/09/2024>
 """
 
 import time         # Para operações com tempo
@@ -23,7 +23,17 @@ class GL:
     height = 600  # altura da tela
     near = 0.01   # plano de corte próximo
     far = 1000    # plano de corte distante
+    model_matrix = np.identity(4)  # Inicialização padrão
+    view_matrix = np.identity(4)   # Inicialização padrão
+    projection_matrix = np.identity(4)  # Inicialização padrão
+    matrix_stack = []  # para matrizes de transformação
 
+
+    @staticmethod
+    def convert_color(color):
+        """Converte a cor de [0, 1] para [0, 255]."""
+        return [int(c * 255) for c in color]
+        
     @staticmethod
     def setup(width, height, near=0.01, far=1000):
         """Definr parametros para câmera de razão de aspecto, plano próximo e distante."""
@@ -43,14 +53,11 @@ class GL:
         # O parâmetro colors é um dicionário com os tipos cores possíveis, para o Polypoint2D
         # você pode assumir inicialmente o desenho dos pontos com a cor emissiva (emissiveColor).
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("Polypoint2D : pontos = {0}".format(point)) # imprime no terminal pontos
-        print("Polypoint2D : colors = {0}".format(colors)) # imprime no terminal as cores
-
+        
         # Exemplo:
         pos_x = GL.width//2
         pos_y = GL.height//2
-        gpu.GPU.draw_pixel([pos_x, pos_y], gpu.GPU.RGB8, [255, 0, 0])  # altera pixel (u, v, tipo, r, g, b)
+        gpu.GPU.draw_pixel([pos_x, pos_y], gpu.GPU.RGB8, [255, 0, 0])  # altera pixel
         # cuidado com as cores, o X3D especifica de (0,1) e o Framebuffer de (0,255)
         
     @staticmethod
@@ -73,7 +80,7 @@ class GL:
         pos_x = GL.width//2
         pos_y = GL.height//2
         gpu.GPU.draw_pixel([pos_x, pos_y], gpu.GPU.RGB8, [255, 0, 255])  # altera pixel (u, v, tipo, r, g, b)
-        # cuidado com as cores, o X3D especifica de (0,1) e o Framebuffer de (0,255)
+        
 
     @staticmethod
     def circle2D(radius, colors):
@@ -125,13 +132,81 @@ class GL:
         # inicialmente, para o TriangleSet, o desenho das linhas com a cor emissiva
         # (emissiveColor), conforme implementar novos materias você deverá suportar outros
         # tipos de cores.
+        vertices = np.array(point).reshape(-1, 3)
+        transformed_vertices = []
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("TriangleSet : pontos = {0}".format(point)) # imprime no terminal pontos
-        print("TriangleSet : colors = {0}".format(colors)) # imprime no terminal as cores
+        # Convertendo a cor do formato [0, 1] para [0, 255]
+        final_color = GL.convert_color(colors['emissiveColor'])
 
-        # Exemplo de desenho de um pixel branco na coordenada 10, 10
-        gpu.GPU.draw_pixel([10, 10], gpu.GPU.RGB8, [255, 255, 255])  # altera pixel
+        for vertex in vertices:
+            vertex_h = np.append(vertex, 1)  # Homogeneização
+            # Aplicar as transformações (modelo, câmera, projeção)
+            transformed_vertex = np.matmul(GL.model_matrix, vertex_h)
+            transformed_vertex = np.matmul(GL.view_matrix, transformed_vertex)
+            transformed_vertex = np.matmul(GL.projection_matrix, transformed_vertex)
+            
+            # Divisão por w para normalizar
+            if transformed_vertex[3] != 0:  # Evitar divisão por zero
+                transformed_vertex /= transformed_vertex[3]
+
+            # Conversão para coordenadas de tela
+            y = int((-transformed_vertex[1] + 1) * GL.height / 2)  # inversão do Y
+            x = int((transformed_vertex[0] + 1) * GL.width / 2)
+            
+            #  Garantindo que as coordenadas estejam dentro dos limites da tela
+            if 0 <= x < GL.width and 0 <= y < GL.height:
+                transformed_vertices.append([x, y, transformed_vertex[2]])  # z permanece o mesmo
+
+        # Rasterizar os triângulos com a cor convertida
+        for i in range(0, len(transformed_vertices), 3):
+            v1 = transformed_vertices[i]
+            v2 = transformed_vertices[i+1]
+            v3 = transformed_vertices[i+2]
+            GL.draw_triangle(v1, v2, v3, final_color)
+
+
+    @staticmethod
+    def draw_triangle(v1, v2, v3, color):
+        """Rasteriza um triângulo na tela."""
+        # Ordena os vértices por y (v1.y <= v2.y <= v3.y)
+        if v1[1] > v2[1]: v1, v2 = v2, v1
+        if v2[1] > v3[1]: v2, v3 = v3, v2
+        if v1[1] > v2[1]: v1, v2 = v2, v1
+
+        def edge_interpolate(y, x0, y0, x1, y1):
+            if y1 == y0:
+                return x0
+            return x0 + (y - y0) * (x1 - x0) / (y1 - y0)
+        
+        # Rasterização da parte de cima
+        for y in range(int(v1[1]), int(v2[1]) + 1):
+            x_start = edge_interpolate(y, v1[0], v1[1], v3[0], v3[1])
+            x_end = edge_interpolate(y, v1[0], v1[1], v2[0], v2[1])
+            if x_start > x_end: x_start, x_end = x_end, x_start
+            for x in range(int(x_start), int(x_end) + 1):
+                if 0 <= x < GL.width and 0 <= y < GL.height:
+                    gpu.GPU.draw_pixel([x, y], gpu.GPU.RGB8, color)
+        
+        # Rasterização da parte de baixo
+        for y in range(int(v2[1]), int(v3[1]) + 1):
+            x_start = edge_interpolate(y, v1[0], v1[1], v3[0], v3[1])
+            x_end = edge_interpolate(y, v2[0], v2[1], v3[0], v3[1])
+            if x_start > x_end: x_start, x_end = x_end, x_start
+            for x in range(int(x_start), int(x_end) + 1):
+                if 0 <= x < GL.width and 0 <= y < GL.height:
+                    gpu.GPU.draw_pixel([x, y], gpu.GPU.RGB8, color)
+
+        @staticmethod
+        def render_scene():
+            points1 = [0.0, 0.5, 0.0,  -0.5, -0.5, 0.0,  0.5, -0.5, 0.0]
+            points2 = [-0.5, 0.5, 0.0,  -1.0, -0.5, 0.0,  0.0, -0.5, 0.0]
+            points3 = [0.5, 0.5, 0.0,  0.0, -0.5, 0.0,  1.0, -0.5, 0.0]
+
+            """Função que decide se deve aplicar a inversão do eixo Y com base na cena."""
+            GL.triangleSet(points1, {'emissiveColor': [1.0, 0.0, 0.0]})  # Triângulo vermelho
+            GL.triangleSet(points2, {'emissiveColor': [0.0, 1.0, 0.0]})  # Triângulo verde
+            GL.triangleSet(points3, {'emissiveColor': [0.0, 0.0, 1.0]})  # Triângulo azul
+            
 
     @staticmethod
     def viewpoint(position, orientation, fieldOfView):
@@ -140,11 +215,48 @@ class GL:
         # câmera virtual. Use esses dados para poder calcular e criar a matriz de projeção
         # perspectiva para poder aplicar nos pontos dos objetos geométricos.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("Viewpoint : ", end='')
-        print("position = {0} ".format(position), end='')
-        print("orientation = {0} ".format(orientation), end='')
-        print("fieldOfView = {0} ".format(fieldOfView))
+      
+        eye = np.array(position)
+        direction = np.array([0, 0, -1])  # Supondo que a câmera inicialmente olha para o eixo -Z
+        up = np.array([0, 1, 0])  # Vetor up padrão
+    
+    # Criar a matriz de visualização (lookAt)
+        GL.view_matrix = GL.look_at(eye, eye + direction, up)
+    
+    # Converter o FOV para radianos se necessário
+        fov = np.deg2rad(fieldOfView) if fieldOfView > np.pi else fieldOfView
+    
+    # Criar a matriz de projeção perspectiva
+        aspect_ratio = GL.width / GL.height
+        near = GL.near
+        far = GL.far
+        GL.projection_matrix = GL.perspective_projection(fov, aspect_ratio, near, far)
+
+     
+    @staticmethod
+    def look_at(eye, center, up):
+        """Cria a matriz de visualização (LookAt)."""
+        f = (center - eye) / np.linalg.norm(center - eye)
+        s = np.cross(f, up) / np.linalg.norm(np.cross(f, up))
+        u = np.cross(s, f)
+        view_matrix = np.identity(4)
+        view_matrix[0, :3] = s
+        view_matrix[1, :3] = u
+        view_matrix[2, :3] = -f
+        view_matrix[:3, 3] = -np.dot(view_matrix[:3, :3], eye)
+        return view_matrix
+
+    @staticmethod
+    def perspective_projection(fov, aspect, near, far):
+        """Cria a matriz de projeção perspectiva."""
+        f = 1.0 / np.tan(fov / 2)
+        projection_matrix = np.array([
+            [f / aspect, 0, 0, 0],
+            [0, f, 0, 0],
+            [0, 0, (far + near) / (near - far), (2 * far * near) / (near - far)],
+            [0, 0, -1, 0]
+        ])
+        return projection_matrix
 
     @staticmethod
     def transform_in(translation, scale, rotation):
@@ -156,8 +268,24 @@ class GL:
         # do objeto ao redor do eixo x, y, z por t radianos, seguindo a regra da mão direita.
         # Quando se entrar em um nó transform se deverá salvar a matriz de transformação dos
         # modelos do mundo em alguma estrutura de pilha.
+        """Função usada para renderizar (na verdade coletar os dados) de Transform."""
+        scale_matrix = np.diag([scale[0], scale[1], scale[2], 1.0])
+    
+        # Implementar a matriz de rotação 
+        angle = rotation[3]  # Ângulo de rotação em radianos
+        axis = np.array(rotation[:3])  # Eixo de rotação (x, y, z)
+        rotation_matrix = GL.create_rotation_matrix(axis, angle)
+    
+        # Criar a matriz de translação
+        translation_matrix = np.identity(4)
+        translation_matrix[:3, 3] = translation
+    
+        # Multiplicar as matrizes na ordem  (escala -> rotação -> translação)
+        GL.model_matrix = np.dot(translation_matrix, np.dot(rotation_matrix, scale_matrix))
+    
+        # Empilhar a matriz resultante
+        GL.matrix_stack.append(GL.model_matrix)
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
         print("Transform : ", end='')
         if translation:
             print("translation = {0} ".format(translation), end='') # imprime no terminal
@@ -168,15 +296,33 @@ class GL:
         print("")
 
     @staticmethod
+    def create_rotation_matrix(axis, angle):
+        # Normalizar o eixo de rotação
+        axis = axis / np.linalg.norm(axis)
+        cos_angle = np.cos(angle)
+        sin_angle = np.sin(angle)
+        ux, uy, uz = axis
+        
+        rotation_matrix = np.array([
+            [cos_angle + ux*ux*(1-cos_angle), ux*uy*(1-cos_angle) - uz*sin_angle, ux*uz*(1-cos_angle) + uy*sin_angle, 0],
+            [uy*ux*(1-cos_angle) + uz*sin_angle, cos_angle + uy*uy*(1-cos_angle), uy*uz*(1-cos_angle) - ux*sin_angle, 0],
+            [uz*ux*(1-cos_angle) - uy*sin_angle, uz*uy*(1-cos_angle) + ux*sin_angle, cos_angle + uz*uz*(1-cos_angle), 0],
+            [0, 0, 0, 1]
+        ])
+        
+        return rotation_matrix
+
+    @staticmethod
     def transform_out():
         """Função usada para renderizar (na verdade coletar os dados) de Transform."""
         # A função transform_out será chamada quando se sair em um nó X3D do tipo Transform do
         # grafo de cena. Não são passados valores, porém quando se sai de um nó transform se
         # deverá recuperar a matriz de transformação dos modelos do mundo da estrutura de
         # pilha implementada.
-
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("Saindo de Transform")
+        if GL.matrix_stack:
+            GL.model_matrix = GL.matrix_stack.pop()
+        
+        
 
     @staticmethod
     def triangleStripSet(point, stripCount, colors):
@@ -291,9 +437,7 @@ class GL:
         # precisar tesselar ela em triângulos, para isso encontre os vértices e defina
         # os triângulos.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("Sphere : radius = {0}".format(radius)) # imprime no terminal o raio da esfera
-        print("Sphere : colors = {0}".format(colors)) # imprime no terminal as cores
+       
 
     @staticmethod
     def navigationInfo(headlight):
@@ -304,9 +448,7 @@ class GL:
         # A luz headlight deve ser direcional, ter intensidade = 1, cor = (1 1 1),
         # ambientIntensity = 0,0 e direção = (0 0 −1).
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("NavigationInfo : headlight = {0}".format(headlight)) # imprime no terminal
-
+        
     @staticmethod
     def directionalLight(ambientIntensity, color, intensity, direction):
         """Luz direcional ou paralela."""
@@ -316,11 +458,7 @@ class GL:
         # que emana da fonte de luz no sistema de coordenadas local. A luz é emitida ao
         # longo de raios paralelos de uma distância infinita.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("DirectionalLight : ambientIntensity = {0}".format(ambientIntensity))
-        print("DirectionalLight : color = {0}".format(color)) # imprime no terminal
-        print("DirectionalLight : intensity = {0}".format(intensity)) # imprime no terminal
-        print("DirectionalLight : direction = {0}".format(direction)) # imprime no terminal
+        
 
     @staticmethod
     def pointLight(ambientIntensity, color, intensity, location):
@@ -331,11 +469,7 @@ class GL:
         # a geometria em um raio de sua localização. O campo do raio deve ser maior ou igual a
         # zero. A iluminação do nó PointLight diminui com a distância especificada.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("PointLight : ambientIntensity = {0}".format(ambientIntensity))
-        print("PointLight : color = {0}".format(color)) # imprime no terminal
-        print("PointLight : intensity = {0}".format(intensity)) # imprime no terminal
-        print("PointLight : location = {0}".format(location)) # imprime no terminal
+        
 
     @staticmethod
     def fog(visibilityRange, color):
@@ -348,10 +482,7 @@ class GL:
         # desenhados com uma cor de cor constante. Objetos muito próximos do visualizador
         # são muito pouco misturados com a cor do nevoeiro.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("Fog : color = {0}".format(color)) # imprime no terminal
-        print("Fog : visibilityRange = {0}".format(visibilityRange))
-
+        
     @staticmethod
     def timeSensor(cycleInterval, loop):
         """Gera eventos conforme o tempo passa."""
@@ -365,9 +496,6 @@ class GL:
 
         # Deve retornar a fração de tempo passada em fraction_changed
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("TimeSensor : cycleInterval = {0}".format(cycleInterval)) # imprime no terminal
-        print("TimeSensor : loop = {0}".format(loop))
 
         # Esse método já está implementado para os alunos como exemplo
         epoch = time.time()  # time in seconds since the epoch as a floating point number.
@@ -386,11 +514,6 @@ class GL:
         # como fechada, com uma transições da última chave para a primeira chave. Se os keyValues
         # na primeira e na última chave não forem idênticos, o campo closed será ignorado.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("SplinePositionInterpolator : set_fraction = {0}".format(set_fraction))
-        print("SplinePositionInterpolator : key = {0}".format(key)) # imprime no terminal
-        print("SplinePositionInterpolator : keyValue = {0}".format(keyValue))
-        print("SplinePositionInterpolator : closed = {0}".format(closed))
 
         # Abaixo está só um exemplo de como os dados podem ser calculados e transferidos
         value_changed = [0.0, 0.0, 0.0]
@@ -411,10 +534,7 @@ class GL:
         # zeroa a um. O campo keyValue deve conter exatamente tantas rotações 3D quanto os
         # quadros-chave no key.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("OrientationInterpolator : set_fraction = {0}".format(set_fraction))
-        print("OrientationInterpolator : key = {0}".format(key)) # imprime no terminal
-        print("OrientationInterpolator : keyValue = {0}".format(keyValue))
+        
 
         # Abaixo está só um exemplo de como os dados podem ser calculados e transferidos
         value_changed = [0, 0, 1, 0]
