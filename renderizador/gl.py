@@ -27,20 +27,72 @@ class GL:
     view_matrix = np.identity(4)   # Inicialização padrão
     projection_matrix = np.identity(4)  # Inicialização padrão
     matrix_stack = []  # para matrizes de transformação
+    supersample_factor = 2  # Fator de superamostragem (2x2)
+    z_buffer = None  # Buffer de profundidade
+    supersample_framebuffer = None  # Framebuffer para supersampling
 
 
     @staticmethod
     def convert_color(color):
-        """Converte a cor de [0, 1] para [0, 255]."""
-        return [int(c * 255) for c in color]
+        """Converte uma cor de formato [r, g, b] em [int(r*255), int(g*255), int(b*255)]."""
+        if isinstance(color, list) and len(color) == 3:
+            return [int(c * 255) for c in color]
+        else:
+            print("Cor inválida recebida. Usando cor padrão.")
+            return [255, 255, 255]  # Cor padrão (branco)
+
+    @staticmethod
+    def get_colors(appearance):
+        """Método de apoio para recuperar cores de um nó Appearance."""
+        colors = {
+            "diffuseColor": [0.8, 0.8, 0.8],  # Valor padrão
+            "emissiveColor": [0.0, 0.0, 0.0],  # Valor padrão
+            "specularColor": [0.0, 0.0, 0.0],  # Valor padrão
+            "shininess": 0.2,  # Valor padrão
+            "transparency": 0.0  # Valor padrão
+        }
+        if appearance and 'material' in appearance:
+            material = appearance['material']
+            colorPerVertex = material.get('colorPerVertex', False)
+            print(f"Cor por vértice ativada? {colorPerVertex}")
+            if 'diffuseColor' in material:
+                colors['diffuseColor'] = material['diffuseColor']
+            if 'emissiveColor' in material:
+                colors['emissiveColor'] = material['emissiveColor']
+            if 'specularColor' in material:
+                colors['specularColor'] = material['specularColor']
+            if 'shininess' in material:
+                colors['shininess'] = material['shininess']
+            if 'transparency' in material:
+                colors['transparency'] = material['transparency']
+        # Adicione o print para verificar o conteúdo do dicionário
+        print(f"Conteúdo do dicionário de cores: {colors}")
+        return colors
         
     @staticmethod
     def setup(width, height, near=0.01, far=1000):
-        """Definr parametros para câmera de razão de aspecto, plano próximo e distante."""
-        GL.width = width
-        GL.height = height
+        """Definir parâmetros para câmera, plano de corte, e framebuffer para supersampling."""
+        GL.width = width * GL.supersample_factor  # Aumenta a resolução para superamostragem
+        GL.height = height * GL.supersample_factor
         GL.near = near
         GL.far = far
+        GL.z_buffer = np.full((GL.height, GL.width), np.inf)  # Inicializa o Z-buffer
+        GL.supersample_framebuffer = np.zeros((GL.height, GL.width, 3), dtype=np.uint8)  # Framebuffer
+        
+    @staticmethod
+    def finalize_render():
+        """Aplica o downsampling após o supersampling."""
+        for y in range(0, GL.height, GL.supersample_factor):
+            for x in range(0, GL.width, GL.supersample_factor):
+                # Calcula a cor média do bloco 2x2 ou 4x4
+                color = np.mean(GL.supersample_framebuffer[y:y+GL.supersample_factor, x:x+GL.supersample_factor], axis=(0, 1))
+                # Redimensiona para a resolução final
+                gpu.GPU.draw_pixel([x//GL.supersample_factor, y//GL.supersample_factor], gpu.GPU.RGB8, color.astype(int))
+                
+    @staticmethod
+    def blend_colors(background_color, foreground_color, transparency):
+        """Mistura a cor do objeto com o fundo, de acordo com a transparência."""
+        return (1 - transparency) * np.array(foreground_color) + transparency * np.array(background_color)
 
     @staticmethod
     def polypoint2D(point, colors):
@@ -122,7 +174,7 @@ class GL:
 
 
     @staticmethod
-    def triangleSet(point, colors):
+    def triangleSet(vertices=None, point=None, appearance=None, colors=None):
         """Função usada para renderizar TriangleSet."""
         # https://www.web3d.org/specifications/X3Dv4/ISO-IEC19775-1v4-IS/Part01/components/rendering.html#TriangleSet
         # Nessa função você receberá pontos no parâmetro point, esses pontos são uma lista
@@ -137,94 +189,145 @@ class GL:
         # inicialmente, para o TriangleSet, o desenho das linhas com a cor emissiva
         # (emissiveColor), conforme implementar novos materias você deverá suportar outros
         # tipos de cores.
-        vertices = np.array(point).reshape(-1, 3)
-        transformed_vertices = []
+        
+        """Função usada para renderizar TriangleSet com interpolação de cores e Z-buffer."""
+        # Se o parâmetro point for passado, ele será usado como vertices
+        if point is not None:
+            vertices = point
+        
+        # Se as cores não forem passadas, obtemos as cores padrão do material
+        if colors is None:
+            colors = GL.get_colors(appearance)
+        
+        final_color = GL.convert_color(colors["diffuseColor"])
+        transparency = colors.get('transparency', 0.0)  # Se houver transparência, é usado, senão assume-se 0
+        
+        triangles_drawn = set()  # Set para rastrear os triângulos já desenhados
+        transformed_vertices = []  # Lista para armazenar os vértices transformados
     
-        # Convertendo a cor de [0, 1] para [0, 255]
-        final_color = GL.convert_color(colors['emissiveColor'])
-    
-        for vertex in vertices:
-            vertex_h = np.append(vertex, 1)  # Homogeneização
-            # Aplicar as transformações (modelo, câmera, projeção)
+        # Loop para transformar os vértices
+        for i in range(0, len(vertices), 3):
+            # Coordenada homogênea com w=1.0
+            vertex_h = np.array([vertices[i], vertices[i + 1], vertices[i + 2], 1.0])
+            
+            # Aplicar a transformação do modelo
             transformed_vertex = np.matmul(GL.model_matrix, vertex_h)
+            # Aplicar a transformação da câmera (view)
             transformed_vertex = np.matmul(GL.view_matrix, transformed_vertex)
+            # Aplicar a projeção em perspectiva
             transformed_vertex = np.matmul(GL.projection_matrix, transformed_vertex)
     
-            # Divisão por w para normalizar
-            if transformed_vertex[3] != 0:  # Evitar divisão por zero
+            # Divisão por w para normalizar as coordenadas de perspectiva
+            if transformed_vertex[3] != 0:
                 transformed_vertex /= transformed_vertex[3]
     
-            # Conversão para coordenadas de tela (ajuste para o eixo y invertido)
-            y = int((-transformed_vertex[1] + 1) * GL.height / 2)  # inversão do Y
+            # Converter para coordenadas de tela
+            y = int((-transformed_vertex[1] + 1) * GL.height / 2)
             x = int((transformed_vertex[0] + 1) * GL.width / 2)
     
-            #  Garantindo que as coordenadas estejam dentro dos limites da tela
+            # Verificar se as coordenadas estão dentro dos limites da tela
             if 0 <= x < GL.width and 0 <= y < GL.height:
+                # Adicionar os vértices transformados à lista
                 transformed_vertices.append([x, y, transformed_vertex[2]])  # z permanece o mesmo
+        
+        # Verificação para garantir que há pelo menos 3 vértices para formar um triângulo
+        if len(transformed_vertices) >= 3:
+            # Loop para desenhar os triângulos
+            for i in range(0, len(transformed_vertices), 3):
+                v1 = transformed_vertices[i]
+                v2 = transformed_vertices[i + 1]
+                v3 = transformed_vertices[i + 2]
     
-        # Rasterizar os triângulos com a cor convertida
-        for i in range(0, len(transformed_vertices), 3):
-            v1 = transformed_vertices[i]
-            v2 = transformed_vertices[i+1]
-            v3 = transformed_vertices[i+2]
-            GL.draw_triangle(v1, v2, v3, final_color)
+                # Criação de uma chave única para identificar o triângulo
+                triangle_key = tuple(sorted([tuple(v1), tuple(v2), tuple(v3)]))
+    
+                # Verificar se o triângulo já foi desenhado
+                if triangle_key not in triangles_drawn:
+                    # Se não foi desenhado, desenhamos o triângulo
+                    print(f"Desenhando triângulo com vértices transformados: {v1}, {v2}, {v3}")
+                    GL.draw_triangle(v1, v2, v3, final_color, final_color, final_color, transparency=transparency)
+                    triangles_drawn.add(triangle_key)  # Adicionar o triângulo ao set de triângulos desenhados
+                else:
+                    print(f"Triângulo {triangle_key} já desenhado, ignorando.")
 
 
     @staticmethod
-    def draw_triangle(v1, v2, v3, color1, color2=None, color3=None):
+    def draw_triangle(v1, v2, v3, color1, color2, color3, colorPerVertex= True,  transparency=0.0):
         """Rasteriza um triângulo na tela."""
         # Se as cores dos vértices forem iguais, usar uma cor única para o triângulo
         if color2 is None: color2 = color1
         if color3 is None: color3 = color1
+        
+        # Força cores diferentes se colorPerVertex for True
+        if colorPerVertex:
+            color1 = [255, 0, 0]  # Vermelho
+            color2 = [0, 255, 0]  # Verde
+            color3 = [0, 0, 255]  # Azul
     
-        # Função auxiliar para interpolar as bordas
         def edge_interpolate(y, x0, y0, x1, y1):
             if y1 == y0:
                 return x0
             return x0 + (y - y0) * (x1 - x0) / (y1 - y0)
     
         # Ordena os vértices por y (v1.y <= v2.y <= v3.y)
-        if v1[1] > v2[1]: v1, v2 = v2, v1; color1, color2 = color2, color1
-        if v2[1] > v3[1]: v2, v3 = v3, v2; color2, color3 = color3, color2
-        if v1[1] > v2[1]: v1, v2 = v2, v1; color1, color2 = color2, color1
+        if v1[1] > v2[1]:
+            v1, v2 = v2, v1
+            color1, color2 = color2, color1
+        if v2[1] > v3[1]:
+            v2, v3 = v3, v2
+            color2, color3 = color3, color2
+        if v1[1] > v2[1]:
+            v1, v2 = v2, v1
+            color1, color2 = color2, color1
     
         # Rasterização da parte superior do triângulo
         for y in range(int(v1[1]), int(v2[1]) + 1):
             x_start = edge_interpolate(y, v1[0], v1[1], v3[0], v3[1])
             x_end = edge_interpolate(y, v1[0], v1[1], v2[0], v2[1])
-            if x_start > x_end: x_start, x_end = x_end, x_start
+            if x_start > x_end:
+                x_start, x_end = x_end, x_start
+
             for x in range(int(x_start), int(x_end) + 1):
                 if 0 <= x < GL.width and 0 <= y < GL.height:
-                    # Calcular as coordenadas baricêntricas
-                    alpha, beta, gamma = GL.calculate_baricentric_coords([x, y], v1, v2, v3)
-                    
-                    # Interpolar as cores usando as coordenadas baricêntricas
-                    interpolated_color = (
-                        alpha * np.array(color1) +
-                        beta * np.array(color2) +
-                        gamma * np.array(color3)
-                    ).astype(int)  # Convertendo para valores inteiros de cor
-                    
-                    gpu.GPU.draw_pixel([x, y], gpu.GPU.RGB8, interpolated_color)
-    
+                    if GL.z_buffer[y, x] > v1[2]:  # Verifica o Z-buffer
+                        alpha, beta, gamma = GL.calculate_baricentric_coords([x, y], v1, v2, v3)
+                        interpolated_color = (
+                            alpha * np.array(color1) +
+                            beta * np.array(color2) +
+                            gamma * np.array(color3)
+                        )
+                        interpolated_color = np.clip(interpolated_color, 0, 255).astype(int)
+
+                        GL.z_buffer[y, x] = v1[2]
+                        background_color = GL.supersample_framebuffer[y, x]
+                        blended_color = GL.blend_colors(background_color, interpolated_color, transparency)
+                        GL.supersample_framebuffer[y, x] = blended_color.astype(int)
+
         # Rasterização da parte inferior do triângulo
         for y in range(int(v2[1]), int(v3[1]) + 1):
             x_start = edge_interpolate(y, v1[0], v1[1], v3[0], v3[1])
             x_end = edge_interpolate(y, v2[0], v2[1], v3[0], v3[1])
-            if x_start > x_end: x_start, x_end = x_end, x_start
+            if x_start > x_end:
+                x_start, x_end = x_end, x_start
+
             for x in range(int(x_start), int(x_end) + 1):
                 if 0 <= x < GL.width and 0 <= y < GL.height:
-                    # Calcular as coordenadas baricêntricas
-                    alpha, beta, gamma = GL.calculate_baricentric_coords([x, y], v1, v2, v3)
-                    
-                    # Interpolar as cores usando as coordenadas baricêntricas
-                    interpolated_color = (
-                        alpha * np.array(color1) +
-                        beta * np.array(color2) +
-                        gamma * np.array(color3)
-                    ).astype(int)  # Convertendo para valores inteiros de cor
-                    
-                    gpu.GPU.draw_pixel([x, y], gpu.GPU.RGB8, interpolated_color)
+                    if GL.z_buffer[y, x] > v1[2]:  # Verifica o Z-buffer
+                        alpha, beta, gamma = GL.calculate_baricentric_coords([x, y], v1, v2, v3)
+                        interpolated_color = (
+                            alpha * np.array(color1) +
+                            beta * np.array(color2) +
+                            gamma * np.array(color3)
+                        )
+                        interpolated_color = np.clip(interpolated_color, 0, 255).astype(int)
+
+                        GL.z_buffer[y, x] = v1[2]
+                        background_color = GL.supersample_framebuffer[y, x]
+                        blended_color = GL.blend_colors(background_color, interpolated_color, transparency)
+                        GL.supersample_framebuffer[y, x] = blended_color.astype(int)
+                        
+                    print(f"Desenhando triângulo: v1={v1}, v2={v2}, v3={v3}")
+             
 
         @staticmethod
         def render_scene():
@@ -247,20 +350,22 @@ class GL:
 
       
         eye = np.array(position)
-        direction = np.array([0, 0, -1])  # Supondo que a câmera inicialmente olha para o eixo -Z
-        up = np.array([0, 1, 0])  # Vetor up padrão
+        direction = np.array([0, 0, -1])  # Inicialmente olha para o eixo -Z
+        up = np.array([0, 1, 0])  # Vetor "up" padrão
     
-    # Criar a matriz de visualização (lookAt)
+        # Verificar a matriz de visualização
         GL.view_matrix = GL.look_at(eye, eye + direction, up)
-    
-    # Converter o FOV para radianos se necessário
+        print(f"Matriz de Visualização: \n{GL.view_matrix}")
+        
+        # Verificar a matriz de projeção
         fov = np.deg2rad(fieldOfView) if fieldOfView > np.pi else fieldOfView
-    
-    # Criar a matriz de projeção perspectiva
         aspect_ratio = GL.width / GL.height
         near = GL.near
         far = GL.far
         GL.projection_matrix = GL.perspective_projection(fov, aspect_ratio, near, far)
+        print(f"Matriz de Projeção: \n{GL.projection_matrix}")
+        
+        
 
      
     @staticmethod
@@ -286,6 +391,7 @@ class GL:
             [0, 0, (far + near) / (near - far), (2 * far * near) / (near - far)],
             [0, 0, -1, 0]
         ])
+        print("Matriz de Projeção Perspectiva: \n", projection_matrix)
         return projection_matrix
 
     @staticmethod
@@ -370,9 +476,9 @@ class GL:
         # depois 2, 3 e 4, e assim por diante. Cuidado com a orientação dos vértices, ou seja,
         # todos no sentido horário ou todos no sentido anti-horário, conforme especificado.
         final_color = GL.convert_color(colors['emissiveColor'])
-    
-        vertices = np.array(point).reshape(-1, 3)  # reorganiza em grupos de 3 (x, y, z)
+        vertices = np.array(point).reshape(-1, 3)
         transformed_vertices = []
+    
         for vertex in vertices:
             vertex_h = np.append(vertex, 1)
             transformed_vertex = np.matmul(GL.model_matrix, vertex_h)
@@ -388,26 +494,19 @@ class GL:
             if 0 <= x < GL.width and 0 <= y < GL.height:
                 transformed_vertices.append([x, y, transformed_vertex[2]])
     
-        # Agora vamos desenhar as tiras de triângulos
-        for i in range(2, len(transformed_vertices)):  # começamos do terceiro vértice
+        # Desenhar tiras de triângulos
+        for i in range(2, len(transformed_vertices)):
             v1 = transformed_vertices[i - 2]
             v2 = transformed_vertices[i - 1]
             v3 = transformed_vertices[i]
     
             if i % 2 == 0:
-                GL.draw_triangle(v1, v2, v3, final_color)
+                GL.draw_triangle(v1, v2, v3, final_color, final_color, final_color)
             else:
-                GL.draw_triangle(v1, v3, v2, final_color)
+                GL.draw_triangle(v1, v3, v2, final_color, final_color, final_color)
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("TriangleStripSet : pontos = {0} ".format(point), end='')
-        for i, strip in enumerate(stripCount):
-            print("strip[{0}] = {1} ".format(i, strip), end='')
-        print("")
-        print("TriangleStripSet : colors = {0}".format(colors)) # imprime no terminal as cores
-
-        # Exemplo de desenho de um pixel branco na coordenada 10, 10
-        gpu.GPU.draw_pixel([10, 10], gpu.GPU.RGB8, [255, 255, 255])  # altera pixel
+        
+        
 
     @staticmethod
     def indexedTriangleStripSet(point, index, colors):
@@ -424,32 +523,31 @@ class GL:
         # primeiro triângulo será com os vértices 0, 1 e 2, depois serão os vértices 1, 2 e 3,
         # depois 2, 3 e 4, e assim por diante. Cuidado com a orientação dos vértices, ou seja,
         # todos no sentido horário ou todos no sentido anti-horário, conforme especificado.
-        final_color = GL.convert_color(colors['emissiveColor'])
-
-        vertices = np.array(point).reshape(-1, 3)  # reorganiza em grupos de 3 (x, y, z)
-        indexed_vertices = [vertices[i] for i in index if i != -1]  # Ignora o -1
-    
+        final_color = [255, 0, 0]
+        vertices = np.array(point).reshape(-1, 3)
+        indexed_vertices = [vertices[i] for i in index if i != -1]
         transformed_vertices = []
+
         for vertex in indexed_vertices:
             vertex_h = np.append(vertex, 1)
             transformed_vertex = np.matmul(GL.model_matrix, vertex_h)
             transformed_vertex = np.matmul(GL.view_matrix, transformed_vertex)
             transformed_vertex = np.matmul(GL.projection_matrix, transformed_vertex)
-    
+
             if transformed_vertex[3] != 0:
                 transformed_vertex /= transformed_vertex[3]
-    
+
             x = int((transformed_vertex[0] + 1) * GL.width / 2)
             y = int((-transformed_vertex[1] + 1) * GL.height / 2)
-    
+
             if 0 <= x < GL.width and 0 <= y < GL.height:
                 transformed_vertices.append([x, y, transformed_vertex[2]])
-    
+
         for i in range(2, len(transformed_vertices)):
             v1 = transformed_vertices[i - 2]
             v2 = transformed_vertices[i - 1]
             v3 = transformed_vertices[i]
-    
+
             if i % 2 == 0:
                 GL.draw_triangle(v1, v2, v3, final_color)
             else:
@@ -459,8 +557,7 @@ class GL:
         print("IndexedTriangleStripSet : pontos = {0}, index = {1}".format(point, index))
         print("IndexedTriangleStripSet : colors = {0}".format(colors)) # imprime as cores
 
-        # Exemplo de desenho de um pixel branco na coordenada 10, 10
-        gpu.GPU.draw_pixel([10, 10], gpu.GPU.RGB8, [255, 255, 255])  # altera pixel
+        
 
     @staticmethod
     def calculate_baricentric_coords(p, p1, p2, p3):
@@ -508,78 +605,56 @@ class GL:
         # cor da textura conforme a posição do mapeamento. Dentro da classe GPU já está
         # implementadado um método para a leitura de imagens.
         
-        final_color = GL.convert_color(colors['emissiveColor'])
-    
-        # Ajuste para escala e projeção
+        
+        
+        final_color = GL.convert_color(colors.get('emissiveColor', [1.0, 1.0, 1.0]))  # Cor padrão: branco
         vertices = np.array(coord).reshape(-1, 3)
         transformed_vertices = []
-        
-        # Aplicando transformações nos vértices
+
         for vertex in vertices:
             vertex_h = np.append(vertex, 1)
             transformed_vertex = np.matmul(GL.model_matrix, vertex_h)
             transformed_vertex = np.matmul(GL.view_matrix, transformed_vertex)
             transformed_vertex = np.matmul(GL.projection_matrix, transformed_vertex)
-    
+
             if transformed_vertex[3] != 0:
                 transformed_vertex /= transformed_vertex[3]
-            
+
             x = int((transformed_vertex[0] + 1) * GL.width / 2)
             y = int((-transformed_vertex[1] + 1) * GL.height / 2)
             z = transformed_vertex[2]
-    
+
             if 0 <= x < GL.width and 0 <= y < GL.height:
                 transformed_vertices.append([x, y, z])
-    
-        # Desenho de triângulos usando os índices fornecidos
+
+        # Processar triângulos com os índices de coordenadas e cores
         i = 0
         while i + 2 < len(coordIndex):
             if coordIndex[i] == -1 or coordIndex[i+1] == -1 or coordIndex[i+2] == -1:
                 i += 1
                 continue
-    
+
             try:
                 v1 = transformed_vertices[coordIndex[i]]
                 v2 = transformed_vertices[coordIndex[i+1]]
                 v3 = transformed_vertices[coordIndex[i+2]]
-    
-                # Calcular interpolação baricêntrica para cores (se for necessario)
-                if colorPerVertex and color and colorIndex:
-                    c1 = colors[colorIndex[i]]
-                    c2 = colors[colorIndex[i+1]]
-                    c3 = colors[colorIndex[i+2]]
-                    # interpolar cores no interior do triângulo
-                    GL.rasterize_triangle(v1, v2, v3, c1, c2, c3)
-                else:
-                    # desenhar com cor única
-                    GL.draw_triangle(v1, v2, v3, final_color)
-            except IndexError:
-                print(f"Índices inválidos: {coordIndex[i]}, {coordIndex[i+1]}, {coordIndex[i+2]}")
-            i += 3
 
-    
-        # Os prints abaixo são só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("IndexedFaceSet : ")
-        if coord:
-            print("\tpontos(x, y, z) = {0}, coordIndex = {1}".format(coord, coordIndex))
-        print("colorPerVertex = {0}".format(colorPerVertex))
-        if colorPerVertex and color and colorIndex:
-            print("\tcores(r, g, b) = {0}, colorIndex = {1}".format(color, colorIndex))
-        if texCoord and texCoordIndex:
-            print("\tpontos(u, v) = {0}, texCoordIndex = {1}".format(texCoord, texCoordIndex))
-        if current_texture:
-            image = gpu.GPU.load_texture(current_texture[0])
-            print("\t Matriz com image = {0}".format(image))
-            print("\t Dimensões da image = {0}".format(image.shape))
-        print("IndexedFaceSet : colors = {0}".format(colors))
+                if colorPerVertex and color and colorIndex:
+                    try:
+                        c1 = GL.convert_color(color[colorIndex[i]] if isinstance(color[colorIndex[i]], list) else final_color)
+                        c2 = GL.convert_color(color[colorIndex[i+1]] if isinstance(color[colorIndex[i+1]], list) else final_color)
+                        c3 = GL.convert_color(color[colorIndex[i+2]] if isinstance(color[colorIndex[i+2]], list) else final_color)
+                        GL.draw_triangle(v1, v2, v3, c1, c2, c3, colorPerVertex=True)
+                    except IndexError:
+                        print("Erro: índice de cor não encontrado ou inválido. Usando cor padrão.")
+                        GL.draw_triangle(v1, v2, v3, final_color, final_color, final_color)
+                else:
+                    GL.draw_triangle(v1, v2, v3, final_color,final_color, final_color)
+            except IndexError:
+                print(f"Erro de índice: {coordIndex[i]}, {coordIndex[i+1]}, {coordIndex[i+2]}")
+            i += 3
         
-        for vertex in vertices:
-            print(f"Coordenadas antes da transformação: {vertex}")
-            vertex_h = np.append(vertex, 1)  # Adiciona a coordenada homogênea
-            transformed_vertex = np.matmul(GL.model_matrix, vertex_h)
-            transformed_vertex = np.matmul(GL.view_matrix, transformed_vertex)
-            transformed_vertex = np.matmul(GL.projection_matrix, transformed_vertex)
-            print(f"Coordenadas após transformação: {transformed_vertex}")
+            
 
     @staticmethod
     def box(size, colors):
